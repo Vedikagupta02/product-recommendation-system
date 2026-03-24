@@ -1,9 +1,8 @@
-pandas
-seaborn
-matplotlib
-python-dotenv
-tiktoken
-langchain
-openai
 streamlit
-faiss-cpu
+python-dotenv
+langchain-core
+langchain-ollama
+pandas
+numpy
+scipy
+scikit-learn

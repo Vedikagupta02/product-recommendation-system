@@ -98,6 +98,8 @@ def preprocess_data(df):
     columns_of_interest = ['pid', 'product_url', 'product_name', 'primary_category',
                            'retail_price', 'discounted_price', 'primary_image_link',
                            'description', 'brand', 'gender']
+    if 'product_rating' in df.columns:
+        columns_of_interest = list(columns_of_interest) + ['product_rating']
     refined_df = df[columns_of_interest]
     refined_df = refined_df.dropna(subset=['primary_category', 'retail_price', 'discounted_price'])
     return refined_df

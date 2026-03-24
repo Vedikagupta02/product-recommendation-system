@@ -1,149 +1,163 @@
 import os
-from dotenv import load_dotenv
-import streamlit as st
-from langchain.chains import RetrievalQA, LLMChain
-from langchain.chat_models import ChatOpenAI
-from langchain.document_loaders import DataFrameLoader
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.memory import ConversationBufferMemory
-from langchain.prompts import PromptTemplate
-from langchain.text_splitter import CharacterTextSplitter
-from langchain.vectorstores import FAISS
+from pathlib import Path
 
-# Load environment variables from .env file
+import pandas as pd
+import streamlit as st
+from dotenv import load_dotenv
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_ollama import ChatOllama
+
+from data_processing import preprocess_data
+from ml_models.collaborative import CollaborativeRecommender, build_dummy_interactions
+from ml_models.content_based import ContentBasedRecommender
+from ml_models.hybrid import format_products_for_prompt, get_hybrid_recommendations
+
 load_dotenv()
 
-def process_data(refined_df):
-    """
-    Process the refined dataset and create the vector store.
-    
-    Args:
-        refined_df (pd.DataFrame): Preprocessed dataset DataFrame.
-        
-    Returns:
-        vectorstore (FAISS): Vector store containing the processed data.
-    """
-    refined_df['combined_info'] = refined_df.apply(lambda row: f"Product ID: {row['pid']}. Product URL: {row['product_url']}. Product Name: {row['product_name']}. Primary Category: {row['primary_category']}. Retail Price: ${row['retail_price']}. Discounted Price: ${row['discounted_price']}. Primary Image Link: {row['primary_image_link']}. Description: {row['description']}. Brand: {row['brand']}. Gender: {row['gender']}", axis=1)
+DEFAULT_OLLAMA_MODEL = "llama3.2"
+DEFAULT_DATASET = "flipkart_com-ecommerce_sample.csv"
 
-    loader = DataFrameLoader(refined_df, page_content_column="combined_info")
-    docs = loader.load()
 
-    text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    texts = text_splitter.split_documents(docs)
+@st.cache_resource(show_spinner="Training hybrid recommenders (one-time)…")
+def load_hybrid_stack(dataset_path: str):
+    """Load CSV, preprocess, fit content-based + collaborative models."""
+    path = Path(dataset_path)
+    if not path.is_file():
+        path = Path(__file__).resolve().parent / dataset_path
+    df = pd.read_csv(path, on_bad_lines="skip", engine="python")
+    refined = preprocess_data(df)
+    content = ContentBasedRecommender()
+    content.fit(refined)
+    inter = build_dummy_interactions(refined)
+    collab = CollaborativeRecommender()
+    collab.fit(inter)
+    return refined, content, collab
 
-    embeddings = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
-    vectorstore = FAISS.from_documents(texts, embeddings)
 
-    return vectorstore
+__all__ = [
+    "load_hybrid_stack",
+    "display_product_recommendation",
+    "get_hybrid_recommendations",
+    "format_products_for_prompt",
+    "DEFAULT_DATASET",
+]
 
-def save_vectorstore(vectorstore, directory):
+
+def display_product_recommendation(dataset_path: str = DEFAULT_DATASET):
     """
-    Save the vector store to a directory.
-    
-    Args:
-        vectorstore (FAISS): Vector store to be saved.
-        directory (str): Directory to save the vector store.
-    """
-    vectorstore.save_local(directory)
-
-def load_vectorstore(directory, embeddings):
-    """
-    Load the vector store from a directory.
-    
-    Args:
-        directory (str): Directory containing the saved vector store.
-        embeddings (OpenAIEmbeddings): Embeddings object.
-        
-    Returns:
-        vectorstore (FAISS): Loaded vector store.
-    """
-    vectorstore = FAISS.load_local(directory, embeddings, allow_dangerous_deserialization = True  )
-    return vectorstore
-
-def display_product_recommendation(refined_df):
-    """
-    Display product recommendation section.
-    
-    Args:
-        refined_df (pd.DataFrame): Preprocessed dataset DataFrame.
+    Hybrid ML (content → collaborative re-rank) + Ollama explanation layer.
     """
     st.header("Product Recommendation")
 
-    vectorstore_dir = 'vectorstore'
+    with st.expander("Setup (free, runs on your PC)", expanded=False):
+        st.markdown(
+            """
+            1. Install **[Ollama](https://ollama.com)** and start it.
+            2. Run: `ollama pull llama3.2` (or set `OLLAMA_MODEL` in `.env`).
+            3. **Hybrid flow:** TF-IDF finds 20 candidates → collaborative re-ranks if you enter a **User ID** → Ollama explains the final list.
 
-    embeddings = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
+            No OpenAI API key required.
+            """
+        )
 
-    if os.path.exists(vectorstore_dir):
-        vectorstore = load_vectorstore(vectorstore_dir, embeddings)
-    else:
-        vectorstore = process_data(refined_df)
-        save_vectorstore(vectorstore, vectorstore_dir)
+    try:
+        refined, content, collab = load_hybrid_stack(dataset_path)
+    except Exception as e:
+        st.error(f"Could not load dataset or train models: {e}")
+        return
 
-    manual_template = """
-    Kindly suggest three similar products based on the description I have provided below:
+    model_name = os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+    llm = ChatOllama(model=model_name, temperature=0)
 
-    Product Department: {department},
-    Product Category: {category},
-    Product Brand: {brand},
-    Maximum Price range: {price}.
+    rag_prompt = ChatPromptTemplate.from_template(
+        """You are a concise retail assistant. These products were shortlisted by a hybrid system (content similarity + optional collaborative filtering).
 
-    Please provide complete answers including product department name, product category, product name, price, and stock quantity.
-    """
-    prompt_manual = PromptTemplate(
-        input_variables=["department", "category", "brand", "price"],
-        template=manual_template,
+{context}
+
+Shopper preferences:
+- Department: {department}
+- Category: {category}
+- Brand: {brand}
+- Max price: {price}
+- User ID (for collaborative step): {user_label}
+
+In 2–4 short paragraphs: (1) why these items fit the query, (2) mention the top 3 by name and why they rank first. If the list is empty, say you found no close matches."""
     )
-
-    llm = ChatOpenAI(openai_api_key=os.getenv("OPENAI_API_KEY"),
-                     model_name='gpt-3.5-turbo', temperature=0)
-
-    chain = LLMChain(
-        llm=llm,
-        prompt=prompt_manual,
-        verbose=True)
-
-    chatbot_template = """
-    You are a friendly, conversational retail shopping assistant that helps customers find products that match their preferences.
-    From the following context and chat history, assist customers in finding what they are looking for based on their input.
-    For each question, suggest three products, including their category, price, and current stock quantity.
-    Sort the answer by the cheapest product.
-    If you don't know the answer, just say that you don't know, don't try to make up an answer.
-
-    {context}
-
-    Chat history: {history}
-
-    Input: {question}
-    Your Response:
-    """
-    chatbot_prompt = PromptTemplate(
-        input_variables=["context", "history", "question"],
-        template=chatbot_template,
-    )
-
-    memory = ConversationBufferMemory(memory_key="history", input_key="question", return_messages=True)
-
-    qa = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type='stuff',
-        retriever=vectorstore.as_retriever(),
-        verbose=True,
-        chain_type_kwargs={
-            "verbose": True,
-            "prompt": chatbot_prompt,
-            "memory": memory}
-    )
+    chain = rag_prompt | llm
 
     department = st.text_input("Product Department")
     category = st.text_input("Product Category")
     brand = st.text_input("Product Brand")
     price = st.text_input("Maximum Price Range")
+    user_raw = st.text_input(
+        "User ID (optional, 0–799 for simulated users — enables collaborative re-ranking)",
+        value="",
+    )
 
     if st.button("Get Recommendations"):
-        response = chain.run(
-            department=department,
-            category=category,
-            brand=brand,
-            price=price
+        query = " ".join(
+            x for x in [department, category, brand, price] if str(x).strip()
         )
-        st.write(response)
+        if not query.strip():
+            st.warning("Enter at least one preference field to build a search query.")
+            return
+
+        user_id = None
+        if str(user_raw).strip() != "":
+            try:
+                user_id = int(user_raw)
+            except ValueError:
+                st.warning("User ID must be an integer; skipping collaborative re-rank.")
+                user_id = None
+
+        try:
+            with st.spinner("Running hybrid retrieval…"):
+                hybrid = get_hybrid_recommendations(
+                    query=query,
+                    refined_df=refined,
+                    content=content,
+                    collab=collab,
+                    user_id=user_id,
+                    content_top_k=20,
+                    final_top_k=10,
+                )
+            ctx = format_products_for_prompt(hybrid["rows"])
+            user_label = str(user_id) if user_id is not None else "not set (content-only order)"
+
+            with st.spinner("Generating explanation with Ollama…"):
+                result = chain.invoke(
+                    {
+                        "context": ctx or "(No products returned — try broader keywords.)",
+                        "department": department or "—",
+                        "category": category or "—",
+                        "brand": brand or "—",
+                        "price": price or "—",
+                        "user_label": user_label,
+                    }
+                )
+            text = getattr(result, "content", None) or str(result)
+            st.subheader("Explanation (RAG)")
+            st.write(text)
+            if not hybrid["rows"].empty:
+                st.subheader("Hybrid shortlist (ML)")
+                st.dataframe(
+                    hybrid["rows"][
+                        [
+                            c
+                            for c in [
+                                "pid",
+                                "product_name",
+                                "brand",
+                                "primary_category",
+                                "discounted_price",
+                                "retail_price",
+                            ]
+                            if c in hybrid["rows"].columns
+                        ]
+                    ],
+                    use_container_width=True,
+                )
+        except Exception as e:
+            st.error(
+                f"Pipeline error (check Ollama is running: `ollama serve`). Details: {e}"
+            )
